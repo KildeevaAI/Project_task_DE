@@ -1,0 +1,439 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+import pandas as pd
+from airflow.hooks.base import BaseHook
+from airflow.models import Connection
+from sqlalchemy import create_engine
+from airflow.operators.empty import EmptyOperator
+import os
+import csv
+import logging
+import time
+import numpy as np
+from sqlalchemy import Numeric, Date, Float, VARCHAR, Integer, DateTime
+
+def get_postgres_engine():
+    connection = BaseHook.get_connection("main_postgresql_connection")
+    return create_engine(f'postgresql+psycopg2://{connection.login}:{connection.password}@'f'{connection.conn_type}:{connection.port}/{connection.schema}')
+
+
+def create_tables():
+   engine = get_postgres_engine()
+   with engine.connect() as conn:
+       conn.execute("""
+        CREATE SCHEMA IF NOT EXISTS DS;
+        CREATE TABLE IF NOT EXISTS DS.FT_BALANCE_F(
+            on_date DATE,
+            account_rk NUMERIC,
+            currency_rk NUMERIC,
+            balance_out FLOAT,
+            PRIMARY KEY (on_date, account_rk)
+        );
+
+        CREATE TABLE IF NOT EXISTS DS.FT_POSTING_F(
+            oper_date DATE NOT NULL,
+            credit_account_rk NUMERIC NOT NULL,
+            debet_account_rk NUMERIC NOT NULL,
+            credit_amount FLOAT,
+            debet_amount FLOAT
+        );
+
+
+        CREATE TABLE IF NOT EXISTS DS.MD_ACCOUNT_D(
+            data_actual_date DATE,
+            data_actual_end_date DATE NOT NULL,
+            account_rk NUMERIC,
+            account_number VARCHAR(20) NOT NULL,
+            char_type VARCHAR(1) NOT NULL,
+            currency_rk NUMERIC NOT NULL,
+            currency_code VARCHAR(3) NOT NULL,
+            PRIMARY KEY (data_actual_date, account_rk)
+        );
+
+
+
+        CREATE TABLE IF NOT EXISTS DS.MD_CURRENCY_D (
+            currency_rk NUMERIC,
+            data_actual_date DATE,
+            data_actual_end_date DATE,
+            currency_code VARCHAR(3),
+            code_iso_char VARCHAR(3),
+            PRIMARY KEY (currency_rk, data_actual_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS DS.MD_EXCHANGE_RATE_D (
+            data_actual_date DATE,
+            data_actual_end_date DATE,
+            currency_rk NUMERIC, 
+            reduced_cource FLOAT, 
+            code_iso_num VARCHAR(3),
+            PRIMARY KEY (data_actual_date, currency_rk)
+        );
+
+
+        CREATE TABLE IF NOT EXISTS DS.MD_LEDGER_ACCOUNT_S (
+            chapter CHAR(1),
+            chapter_name VARCHAR(16),
+            section_number INTEGER,
+            section_name VARCHAR(22),
+            subsection_name VARCHAR(21),
+            ledger1_account INTEGER,
+            ledger1_account_name VARCHAR(47),
+            ledger_account INTEGER,
+            ledger_account_name VARCHAR(153),
+            characteristic CHAR(1),
+            start_date DATE,
+            end_date DATE,
+            PRIMARY KEY (ledger_account, start_date)
+        );
+        """)
+       
+def load_to_ft_balance_f():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу ft_balance_f']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу ft_balance_f']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    time.sleep(5)
+    
+    df = pd.read_csv("dags/csv_files/ft_balance_f.csv", sep=";")
+    df['ON_DATE'] = pd.to_datetime(df['ON_DATE'])
+    with engine.connect() as conn:
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO ds.ft_balance_f (ON_DATE, ACCOUNT_RK, CURRENCY_RK, BALANCE_OUT)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (ON_DATE, ACCOUNT_RK)
+                DO UPDATE SET 
+                    CURRENCY_RK = EXCLUDED.CURRENCY_RK,
+                    BALANCE_OUT = EXCLUDED.BALANCE_OUT
+            """, (row['ON_DATE'], row['ACCOUNT_RK'], row['CURRENCY_RK'], row['BALANCE_OUT']))
+
+
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу ft_balance_f']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+    
+
+def load_to_ft_posting_f():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу ft_posting_f']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу ft_posting_f']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    time.sleep(5)
+
+    df = pd.read_csv("dags/csv_files/ft_posting_f.csv", sep=";")
+    df['OPER_DATE'] = pd.to_datetime(df['OPER_DATE'], format='%d-%m-%Y')
+    df.columns = df.columns.str.lower()
+    df.to_sql(name="ft_posting_f", 
+              con=engine, 
+              schema = 'ds',
+              if_exists="replace", 
+              index=False,
+              dtype={
+                  'OPER_DATE': Date(),
+                  'CREDIT_ACCOUNT_RK': Numeric(),
+                  'DEBET_ACCOUNT_RK': Numeric(),
+                  'CREDIT_AMOUNT': Float(),
+                  'DEBET_AMOUNT': Float()
+                  }
+                )
+    
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу ft_posting_f']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+def load_to_md_account_d():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_account_d']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_account_d']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    time.sleep(5)
+    
+    df = pd.read_csv("dags/csv_files/md_account_d.csv", sep=";")
+
+    with engine.connect() as conn:
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO ds.md_account_d (DATA_ACTUAL_DATE, DATA_ACTUAL_END_DATE, ACCOUNT_RK, ACCOUNT_NUMBER, CHAR_TYPE, CURRENCY_RK, CURRENCY_CODE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (DATA_ACTUAL_DATE, ACCOUNT_RK)
+                DO UPDATE SET 
+                    DATA_ACTUAL_DATE = EXCLUDED.DATA_ACTUAL_DATE,
+                    ACCOUNT_RK = EXCLUDED.ACCOUNT_RK
+            """, (row['DATA_ACTUAL_DATE'], row['DATA_ACTUAL_END_DATE'], row['ACCOUNT_RK'], row['ACCOUNT_NUMBER'], row['CHAR_TYPE'], row['CURRENCY_RK'], row['CURRENCY_CODE']))
+
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу md_account_d']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+
+
+def load_to_md_currency_d():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_currency_d']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_currency_d']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    
+    time.sleep(5)
+ 
+    df = pd.read_csv("dags/csv_files/md_currency_d.csv", sep=";", encoding_errors="replace")
+    df = df.replace([pd.NA, pd.NaT, np.nan], None)
+    df.replace("�", None, inplace=True)
+    
+    # Обработка кода валюты
+    df['CURRENCY_CODE'] = df['CURRENCY_CODE'].astype(str)
+    df['CURRENCY_CODE'] = df['CURRENCY_CODE'].str.split('.').str[0]
+    df['CURRENCY_CODE'] = df['CURRENCY_CODE'].replace('None', None)
+
+
+
+    with engine.connect() as conn:
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO ds.md_currency_d (CURRENCY_RK, DATA_ACTUAL_DATE, DATA_ACTUAL_END_DATE, CURRENCY_CODE, CODE_ISO_CHAR)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (CURRENCY_RK, DATA_ACTUAL_DATE)
+                DO UPDATE SET 
+                    CURRENCY_RK = EXCLUDED.CURRENCY_RK,
+                    DATA_ACTUAL_DATE = EXCLUDED.DATA_ACTUAL_DATE
+            """, (row['CURRENCY_RK'], row['DATA_ACTUAL_DATE'], row['DATA_ACTUAL_END_DATE'], row['CURRENCY_CODE'], row['CODE_ISO_CHAR']))
+
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу md_currency_d']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+        
+
+def load_to_md_exchange_rate_d():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_exchange_rate_d']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_exchange_rate_d']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    
+    time.sleep(5)
+
+    df = pd.read_csv("dags/csv_files/md_exchange_rate_d.csv", sep=";")
+    with engine.connect() as conn:
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO ds.md_exchange_rate_d (DATA_ACTUAL_DATE, DATA_ACTUAL_END_DATE, CURRENCY_RK, REDUCED_COURCE, CODE_ISO_NUM)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (DATA_ACTUAL_DATE, CURRENCY_RK)
+                DO UPDATE SET 
+                    DATA_ACTUAL_DATE = EXCLUDED.DATA_ACTUAL_DATE,
+                    CURRENCY_RK = EXCLUDED.CURRENCY_RK
+            """, (row['DATA_ACTUAL_DATE'], row['DATA_ACTUAL_END_DATE'], row['CURRENCY_RK'], row['REDUCED_COURCE'], row['CODE_ISO_NUM']))
+
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу md_exchange_rate_d']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+
+def load_to_md_ledger_account_s():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_ledger_account_s']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу md_ledger_account_s']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    
+    time.sleep(5)
+    df = pd.read_csv("dags/csv_files/md_ledger_account_s.csv", sep=";")
+
+
+    with engine.connect() as conn:
+        for _, row in df.iterrows():
+            conn.execute("""
+                INSERT INTO ds.md_ledger_account_s (CHAPTER, CHAPTER_NAME, SECTION_NUMBER, SECTION_NAME, SUBSECTION_NAME, LEDGER1_ACCOUNT, LEDGER1_ACCOUNT_NAME, LEDGER_ACCOUNT, LEDGER_ACCOUNT_NAME, CHARACTERISTIC, START_DATE, END_DATE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (LEDGER_ACCOUNT, START_DATE)
+                DO UPDATE SET 
+                    LEDGER_ACCOUNT = EXCLUDED.LEDGER_ACCOUNT,
+                    START_DATE = EXCLUDED.START_DATE
+            """, (row['CHAPTER'], row['CHAPTER_NAME'], row['SECTION_NUMBER'], row['SECTION_NAME'], row['SUBSECTION_NAME'], row['LEDGER1_ACCOUNT'], row['LEDGER1_ACCOUNT_NAME'], row['LEDGER_ACCOUNT'], row['LEDGER_ACCOUNT_NAME'], row['CHARACTERISTIC'], row['START_DATE'], row['END_DATE']))
+    
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу md_ledger_account_s']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+  
+
+default_args = {
+    'owner': 'airflow',
+    #'retries': 1,
+    #'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='ds_layer',
+    default_args=default_args,
+    start_date=datetime.now(),
+    catchup=False,
+) as dag:
+
+    start = EmptyOperator(
+        task_id="start"
+    )
+
+    task_create_tables = PythonOperator(
+        task_id = 'create_tables',
+        python_callable=create_tables
+    )
+    
+    task_load_to_ft_balance_f = PythonOperator(
+        task_id = 'load_to_ft_balance_f',
+        python_callable=load_to_ft_balance_f
+    )
+
+    task_load_to_ft_posting_f = PythonOperator(
+        task_id = 'load_to_ft_posting_f',
+        python_callable=load_to_ft_posting_f
+    )
+    
+
+    task_load_to_md_account_d = PythonOperator(
+        task_id = 'load_to_md_account_d',
+        python_callable=load_to_md_account_d
+    )
+
+    task_load_to_md_currency_d = PythonOperator(
+        task_id = 'load_to_md_currency_d',
+        python_callable=load_to_md_currency_d
+    )
+    
+    task_load_to_md_exchange_rate_d = PythonOperator(
+        task_id = 'load_to_md_exchange_rate_d',
+        python_callable=load_to_md_exchange_rate_d
+    )
+
+    task_load_to_md_ledger_account_s = PythonOperator(
+        task_id = 'load_to_md_ledger_account_s',
+        python_callable=load_to_md_ledger_account_s
+    )
+    
+    end = EmptyOperator(
+        task_id="end"
+    ) 
+
+
+start >> task_create_tables >> task_load_to_ft_balance_f >> task_load_to_ft_posting_f >> task_load_to_md_account_d >> task_load_to_md_currency_d >> task_load_to_md_exchange_rate_d >> task_load_to_md_ledger_account_s >> end
