@@ -1,0 +1,190 @@
+from datetime import datetime, timedelta, date
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+import pandas as pd
+from airflow.hooks.base import BaseHook
+from airflow.models import Connection
+import sqlalchemy
+from sqlalchemy import create_engine
+from airflow.operators.empty import EmptyOperator
+import numpy as np
+import os
+from sqlalchemy import Numeric, Date, Float, VARCHAR, Integer, DateTime
+
+def get_postgres_engine():
+    connection = BaseHook.get_connection("main_postgresql_connection")
+    return create_engine(f'postgresql+psycopg2://{connection.login}:{connection.password}@'f'{connection.conn_type}:{connection.port}/{connection.schema}')
+
+def create_tables():
+   engine = get_postgres_engine()
+   with engine.connect() as conn:
+       trans = conn.begin()
+       conn.execute("""
+        CREATE SCHEMA IF NOT EXISTS DM;
+                    
+        CREATE TABLE IF NOT EXISTS DM.DM_F101_ROUND_F(
+        FROM_DATE DATE,
+        TO_DATE DATE,
+        CHAPTER VARCHAR(1),
+        LEDGER_ACCOUNT VARCHAR(5),
+        CHARACTERISTIC VARCHAR(1),
+        BALANCE_IN_RUB NUMERIC(23, 8),
+        BALANCE_IN_VAL NUMERIC(23, 8),
+        BALANCE_IN_TOTAL NUMERIC(23, 8),
+        TURN_DEB_RUB NUMERIC(23, 8),
+        TURN_DEB_VAL NUMERIC(23, 8),
+        TURN_DEB_TOTAL NUMERIC(23, 8),
+        TURN_CRE_RUB NUMERIC(23, 8),
+        TURN_CRE_VAL NUMERIC(23, 8),
+        TURN_CRE_TOTAL NUMERIC(23, 8),
+        BALANCE_OUT_RUB NUMERIC(23, 8),
+        BALANCE_OUT_VAL NUMERIC(23, 8),
+        BALANCE_OUT_TOTAL NUMERIC(23, 8)
+        )
+        """)
+       trans.commit()
+
+def create_procedure_fill_f_round_f():
+    engine = get_postgres_engine()
+    
+    
+    with engine.connect() as conn:
+       trans = conn.begin()
+       conn.execute("""
+        CREATE OR REPLACE PROCEDURE dm.fill_f101_round_f(i_OnDate DATE)
+        LANGUAGE plpgsql
+        AS $$ 
+        BEGIN
+            DELETE FROM DM.DM_F101_ROUND_F WHERE from_date = (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE;
+            WITH t1 AS (
+            SELECT DISTINCT SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT AS LEDGER_ACCOUNT, 
+            COALESCE(SUM(balance_out_rub) FILTER(WHERE on_date = (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND (currency_code = '810' OR currency_code = '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS BALANCE_IN_RUB,
+            COALESCE(SUM(balance_out_rub) FILTER(WHERE on_date = (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND (currency_code <> '810' AND currency_code <> '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS BALANCE_IN_VAL,
+            COALESCE(SUM(balance_out_rub) FILTER(WHERE on_date = (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code = '810' OR currency_code = '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS BALANCE_OUT_RUB,
+            COALESCE(SUM(balance_out_rub) FILTER(WHERE on_date = (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code <> '810' AND currency_code <> '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS BALANCE_OUT_VAL
+            FROM DS.MD_ACCOUNT_D LEFT JOIN DM.DM_ACCOUNT_BALANCE_F
+            ON DS.MD_ACCOUNT_D.account_rk = DM.DM_ACCOUNT_BALANCE_F.account_rk
+            WHERE DS.MD_ACCOUNT_D.DATA_ACTUAL_DATE >= i_OnDate - INTERVAL '1 month' - INTERVAL '1 day' AND
+            DS.MD_ACCOUNT_D.DATA_ACTUAL_END_DATE <= i_OnDate - INTERVAL '1 day'
+            ),
+            t2 AS(
+            SELECT DISTINCT SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT AS LEDGER_ACCOUNT,
+            COALESCE(SUM(debet_amount_rub) FILTER(WHERE on_date >= (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND on_date <= (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code = '810' OR currency_code = '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS TURN_DEB_RUB,
+            COALESCE(SUM(debet_amount_rub) FILTER(WHERE on_date >= (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND on_date <= (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code <> '810' AND currency_code <> '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS TURN_DEB_VAL,
+            COALESCE(SUM(credit_amount_rub) FILTER(WHERE on_date >= (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND on_date <= (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code = '810' OR currency_code = '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS TURN_CRE_RUB,
+            COALESCE(SUM(credit_amount_rub) FILTER(WHERE on_date >= (i_OnDate - INTERVAL '1 month' - INTERVAL '1 day')::DATE AND on_date <= (i_OnDate - INTERVAL '1 day')::DATE AND (currency_code <> '810' AND currency_code <> '643')) OVER(PARTITION BY SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT), 0) AS TURN_CRE_VAL
+            FROM DS.MD_ACCOUNT_D LEFT JOIN DM.DM_ACCOUNT_TURNOVER_F
+            ON DS.MD_ACCOUNT_D.account_rk = DM.DM_ACCOUNT_TURNOVER_F.account_rk
+            WHERE DS.MD_ACCOUNT_D.DATA_ACTUAL_DATE >= i_OnDate - INTERVAL '1 month' - INTERVAL '1 day' AND
+            DS.MD_ACCOUNT_D.DATA_ACTUAL_END_DATE <= i_OnDate - INTERVAL '1 day'
+            )
+            
+            INSERT INTO DM.DM_F101_ROUND_F
+            SELECT DISTINCT (i_OnDate - INTERVAL '1 month')::DATE AS FROM_DATE,
+            (i_OnDate - INTERVAL '1 day')::DATE AS TO_DATE,
+            DS.MD_LEDGER_ACCOUNT_S.CHAPTER,
+            SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5) AS LEDGER_ACCOUNT,
+            DS.MD_ACCOUNT_D.char_type,
+            BALANCE_IN_RUB,
+            BALANCE_IN_VAL,
+            BALANCE_IN_RUB + BALANCE_IN_VAL AS BALANCE_IN_TOTAL,
+            TURN_DEB_RUB,
+            TURN_DEB_VAL,
+            TURN_DEB_RUB + TURN_DEB_VAL AS TURN_DEB_TOTAL,
+            TURN_CRE_RUB,
+            TURN_CRE_VAL,
+            TURN_CRE_RUB + TURN_CRE_VAL AS TURN_CRE_TOTAL,
+            BALANCE_OUT_RUB,
+            BALANCE_OUT_VAL,
+            BALANCE_OUT_RUB + BALANCE_OUT_VAL AS BALANCE_OUT_TOTAL
+            FROM DS.MD_ACCOUNT_D LEFT JOIN DS.MD_LEDGER_ACCOUNT_S ON SUBSTRING(DS.MD_ACCOUNT_D.account_number FROM 1 FOR 5)::INT = DS.MD_LEDGER_ACCOUNT_S.LEDGER_ACCOUNT
+            LEFT JOIN t1 ON DS.MD_LEDGER_ACCOUNT_S.LEDGER_ACCOUNT = t1.LEDGER_ACCOUNT
+            LEFT JOIN t2 ON t1.LEDGER_ACCOUNT = t2.LEDGER_ACCOUNT
+            WHERE DS.MD_ACCOUNT_D.DATA_ACTUAL_DATE <= i_OnDate - INTERVAL '1 month' AND 
+            DS.MD_ACCOUNT_D.DATA_ACTUAL_END_DATE >= i_OnDate - INTERVAL '1 day';
+            
+        END;
+        $$;
+
+        """)
+       trans.commit()
+    
+    
+
+def fill_f_round_f():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало расчета 101 формы']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало расчета 101 формы']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    with engine.connect() as conn:
+        trans = conn.begin()
+        conn.execute("""call dm.fill_f101_round_f('2018-02-01'::DATE) """)
+        trans.commit()
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание расчета 101 формы']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+
+  
+  
+
+default_args = {
+    'owner': 'airflow',
+    #'retries': 1,
+    #'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='load_to_dm_f101',
+    default_args=default_args,
+    start_date=datetime.now(),
+    catchup=False,
+) as dag:
+
+    start = EmptyOperator(
+        task_id="start"
+    )
+    
+    task_create_tables = PythonOperator(
+        task_id = 'create_tables',
+        python_callable=create_tables
+    )
+
+
+    task_create_procedure_fill_f_round_f = PythonOperator(
+        task_id = 'create_procedure_fill_f_round_f',
+        python_callable=create_procedure_fill_f_round_f
+    )
+    
+    task_call_fill_f_round_f = PythonOperator(
+        task_id = 'call_fill_f_round_f',
+        python_callable=fill_f_round_f
+    )
+
+
+    end = EmptyOperator(
+        task_id="end"
+    ) 
+
+
+start >> task_create_tables >> task_create_procedure_fill_f_round_f >> task_call_fill_f_round_f>>  end
