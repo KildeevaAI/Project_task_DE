@@ -1,0 +1,243 @@
+from datetime import datetime, timedelta, date
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+import pandas as pd
+from airflow.hooks.base import BaseHook
+from airflow.models import Connection
+import sqlalchemy
+from sqlalchemy import create_engine
+from airflow.operators.empty import EmptyOperator
+import numpy as np
+import os
+from sqlalchemy import Numeric, Date, Float, VARCHAR, Integer, DateTime
+
+def get_postgres_engine():
+    connection = BaseHook.get_connection("main_postgresql_connection")
+    return create_engine(f'postgresql+psycopg2://{connection.login}:{connection.password}@'f'{connection.conn_type}:{connection.port}/{connection.schema}')
+
+def create_tables():
+   engine = get_postgres_engine()
+   with engine.connect() as conn:
+       trans = conn.begin()
+       conn.execute("""
+        CREATE SCHEMA IF NOT EXISTS DM;
+                    
+        CREATE TABLE IF NOT EXISTS DM.DM_ACCOUNT_TURNOVER_F(
+            on_date DATE,
+            account_rk NUMERIC,
+            credit_amount NUMERIC(23, 8),
+            credit_amount_rub NUMERIC(23, 8),
+            debet_amount NUMERIC(23, 8),
+            debet_amount_rub NUMERIC(23, 8)
+        );
+                    
+        CREATE TABLE IF NOT EXISTS DM.DM_ACCOUNT_BALANCE_F(
+            on_date DATE,
+            account_rk NUMERIC,
+            balance_out NUMERIC(23, 8),
+            balance_out_rub NUMERIC(23, 8)
+        )
+        """)
+       trans.commit()
+
+def create_procedure_fill_account_turnover_f():
+    engine = get_postgres_engine()
+    
+    
+    with engine.connect() as conn:
+       trans = conn.begin()
+       conn.execute("""
+        CREATE OR REPLACE PROCEDURE ds.fill_account_turnover_f(i_OnDate DATE)
+        LANGUAGE plpgsql
+        AS $$ 
+        BEGIN
+            DELETE FROM DM.DM_ACCOUNT_TURNOVER_F WHERE on_date = i_OnDate;
+            WITH credit_amount AS
+            (SELECT credit_account_rk, 
+            SUM(DS.FT_POSTING_F.credit_amount)as credit_amount, 
+            SUM(DS.FT_POSTING_F.credit_amount) * COALESCE(DS.MD_EXCHANGE_RATE_D.REDUCED_COURCE, 1) AS credit_amount_rub 
+            FROM DS.FT_POSTING_F LEFT JOIN DS.FT_BALANCE_F on DS.FT_POSTING_F.credit_account_rk = DS.FT_BALANCE_F.account_rk
+            LEFT JOIN DS.MD_EXCHANGE_RATE_D ON DS.FT_BALANCE_F.currency_rk = DS.MD_EXCHANGE_RATE_D.currency_rk
+            WHERE oper_date = i_OnDate AND DS.MD_EXCHANGE_RATE_D.data_actual_date <= i_OnDate and i_OnDate <= DS.MD_EXCHANGE_RATE_D.data_actual_end_date
+            GROUP BY credit_account_rk, DS.MD_EXCHANGE_RATE_D.REDUCED_COURCE),
+            debet_amount AS
+            (SELECT debet_account_rk, SUM(DS.FT_POSTING_F.debet_amount) as debet_amount, SUM(DS.FT_POSTING_F.debet_amount) * COALESCE(DS.MD_EXCHANGE_RATE_D.REDUCED_COURCE, 1) AS debet_amount_rub 
+            FROM DS.FT_POSTING_F LEFT JOIN DS.FT_BALANCE_F on DS.FT_POSTING_F.debet_account_rk = DS.FT_BALANCE_F.account_rk
+            LEFT JOIN DS.MD_EXCHANGE_RATE_D ON DS.FT_BALANCE_F.currency_rk = DS.MD_EXCHANGE_RATE_D.currency_rk
+            WHERE oper_date = i_OnDate AND DS.MD_EXCHANGE_RATE_D.data_actual_date <= i_OnDate and i_OnDate <= DS.MD_EXCHANGE_RATE_D.data_actual_end_date
+            GROUP BY debet_account_rk, DS.MD_EXCHANGE_RATE_D.REDUCED_COURCE)
+            INSERT INTO DM.DM_ACCOUNT_TURNOVER_F
+            SELECT i_OnDate, COALESCE(credit_account_rk, debet_account_rk), COALESCE(credit_amount, 0), COALESCE(credit_amount_rub, 0), COALESCE(debet_amount, 0), COALESCE(debet_amount_rub, 0)
+            FROM credit_amount FULL JOIN debet_amount ON credit_amount.credit_account_rk = debet_amount.debet_account_rk;
+        END;
+        $$;
+        """)
+       trans.commit()
+    
+    
+
+
+def create_procedure_fill_account_balance_f():
+    engine = get_postgres_engine()
+    
+    with engine.connect() as conn:
+       trans = conn.begin()
+       conn.execute("""
+        DELETE FROM DM.DM_ACCOUNT_BALANCE_F WHERE on_date = '2017-12-31'::DATE;
+        INSERT INTO DM.DM_ACCOUNT_BALANCE_F	
+        SELECT '2017-12-31'::DATE, account_rk, balance_out, balance_out * COALESCE(reduced_cource, 1) AS balance_out_rub
+        FROM DS.FT_BALANCE_F LEFT JOIN DS.MD_EXCHANGE_RATE_D ON DS.FT_BALANCE_F.currency_rk = DS.MD_EXCHANGE_RATE_D.currency_rk
+        AND DS.MD_EXCHANGE_RATE_D.data_actual_date <= '2017-12-31'::DATE AND DS.MD_EXCHANGE_RATE_D.data_actual_end_date >= '2017-12-31'::DATE;
+
+        CREATE OR REPLACE PROCEDURE ds.fill_account_balance_f(i_OnDate DATE)
+        LANGUAGE plpgsql
+        AS $$ 
+        BEGIN
+            DELETE FROM DM.DM_ACCOUNT_BALANCE_F WHERE on_date = i_OnDate;
+            INSERT INTO DM.DM_ACCOUNT_BALANCE_F
+            SELECT i_OnDate, DS.MD_ACCOUNT_D.account_rk, 
+            CASE WHEN char_type = 'А' THEN COALESCE(balance_out, 0) + COALESCE(DM.DM_ACCOUNT_TURNOVER_F.debet_amount, 0) - COALESCE(DM.DM_ACCOUNT_TURNOVER_F.credit_amount, 0)
+            WHEN char_type = 'П' THEN COALESCE(balance_out, 0) - COALESCE(DM.DM_ACCOUNT_TURNOVER_F.debet_amount, 0) + COALESCE(DM.DM_ACCOUNT_TURNOVER_F.credit_amount, 0)
+            END AS balance_out,
+            CASE WHEN char_type = 'А' THEN COALESCE(balance_out_rub, 0) + COALESCE(DM.DM_ACCOUNT_TURNOVER_F.debet_amount_rub, 0) - COALESCE(DM.DM_ACCOUNT_TURNOVER_F.credit_amount_rub, 0)
+            WHEN char_type = 'П' THEN COALESCE(balance_out_rub, 0) - COALESCE(DM.DM_ACCOUNT_TURNOVER_F.debet_amount_rub, 0) + COALESCE(DM.DM_ACCOUNT_TURNOVER_F.credit_amount_rub, 0)
+            END AS balance_out_rub
+            FROM DS.MD_ACCOUNT_D LEFT JOIN DM.DM_ACCOUNT_BALANCE_F ON DS.MD_ACCOUNT_D.account_rk = DM.DM_ACCOUNT_BALANCE_F.account_rk
+            AND DM.DM_ACCOUNT_BALANCE_F.on_date = (i_OnDate - INTERVAL '1 day')::DATE
+            AND i_OnDate >= DS.MD_ACCOUNT_D.data_actual_date AND i_OnDate <= DS.MD_ACCOUNT_D.data_actual_end_date
+            LEFT JOIN DM.DM_ACCOUNT_TURNOVER_F ON DM.DM_ACCOUNT_BALANCE_F.account_rk = DM.DM_ACCOUNT_TURNOVER_F.account_rk 
+            AND DM.DM_ACCOUNT_TURNOVER_F.on_date = i_OnDate;
+        END;
+        $$;
+
+        """)
+       trans.commit()
+
+    
+
+def fill_account_turnover_f():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало расчета витрины оборотов DM.DM_ACCOUNT_TURNOVER_F']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало расчета витрины оборотов DM.DM_ACCOUNT_TURNOVER_F']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    i_OnDate = date(2018, 1, 1)
+    days = 31
+    with engine.connect() as conn:
+        trans = conn.begin()
+        for i in range(days):
+            conn.execute("""call ds.fill_account_turnover_f(%s) """, i_OnDate)
+            i_OnDate += timedelta(days = 1)
+        trans.commit()
+    
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание расчета витрины оборотов DM.DM_ACCOUNT_TURNOVER_F']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+def fill_account_balance_f():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+
+    if os.path.getsize(path_filename) == 0:
+         df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало расчета витрины остатков DM.DM_ACCOUNT_BALANCE_F']})
+         df_load_start.index.name = 'id_load'
+         df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало расчета витрины остатков DM.DM_ACCOUNT_BALANCE_F']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+              
+    i_OnDate = date(2018, 1, 1)
+    days = 31
+    with engine.connect() as conn:
+        trans = conn.begin()
+        for i in range(days):
+            conn.execute("""call ds.fill_account_balance_f(%s) """, i_OnDate)
+            i_OnDate += timedelta(days = 1)
+        trans.commit()
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание расчета витрины остатков DM.DM_ACCOUNT_BALANCE_F']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+  
+  
+
+default_args = {
+    'owner': 'airflow',
+    #'retries': 1,
+    #'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='load_to_dm',
+    default_args=default_args,
+    start_date=datetime.now(),
+    catchup=False,
+) as dag:
+
+    start = EmptyOperator(
+        task_id="start"
+    )
+    
+    task_create_tables = PythonOperator(
+        task_id = 'create_tables',
+        python_callable=create_tables
+    )
+
+    task_create_procedure_fill_account_turnover_f = PythonOperator(
+        task_id = 'create_procedure_fill_account_turnover_f',
+        python_callable=create_procedure_fill_account_turnover_f
+    )
+
+    task_create_procedure_fill_account_balance_f = PythonOperator(
+        task_id = 'create_procedure_fill_account_balance_f',
+        python_callable=create_procedure_fill_account_balance_f
+    )
+    
+    task_call_fill_account_turnover_f = PythonOperator(
+        task_id = 'call_fill_account_turnover_f',
+        python_callable=fill_account_turnover_f
+    )
+
+    task_call_fill_account_balance_f = PythonOperator(
+        task_id = 'call_fill_account_balance_f',
+        python_callable=fill_account_balance_f
+    )
+
+    end = EmptyOperator(
+        task_id="end"
+    ) 
+
+
+start >> task_create_tables >> task_create_procedure_fill_account_turnover_f >> task_create_procedure_fill_account_balance_f >> task_call_fill_account_turnover_f >> task_call_fill_account_balance_f >> end
