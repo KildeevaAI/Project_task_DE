@@ -1,0 +1,124 @@
+from datetime import datetime, timedelta, date
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+import pandas as pd
+from airflow.hooks.base import BaseHook
+from airflow.models import Connection
+import sqlalchemy
+import csv
+from sqlalchemy import create_engine
+from airflow.operators.empty import EmptyOperator
+import numpy as np
+import os
+from sqlalchemy import Numeric, Date, Float, VARCHAR, Integer, DateTime
+
+def get_postgres_engine():
+    connection = BaseHook.get_connection("main_postgresql_connection")
+    return create_engine(f'postgresql+psycopg2://{connection.login}:{connection.password}@'f'{connection.conn_type}:{connection.port}/{connection.schema}')
+
+def export_from_db():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+    if os.path.getsize(path_filename) == 0:
+        df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало выгрузки данных из таблицы f101_round_f в csv-файл']})
+        df_load_start.index.name = 'id_load'
+        df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало выгрузки данных из таблицы f101_round_f в csv-файл']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    
+    path_filename2 = 'dags/csv_files1.4/dm_f101_round_f.csv'
+    df = pd.read_sql("SELECT * FROM DM.DM_F101_ROUND_F", engine)
+    column_names = df.columns.tolist()
+    df.columns = column_names
+    df.to_csv(path_filename2, index = False)
+    
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание выгрузки данных из таблицы f101_round_f в csv-файл']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+    
+   
+def import_from_csv():
+    engine = get_postgres_engine()
+    path_filename = 'dags/loadlogs/load_logs_file.csv'
+    if os.path.getsize(path_filename) == 0:
+        df_load_start = pd.DataFrame({'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу f101_round_f']})
+        df_load_start.index.name = 'id_load'
+        df_load_start.to_csv(path_filename, index = True)
+    else:
+        df_load_start = pd.read_csv(path_filename, sep = ',')
+        last_index = df_load_start.index[-1]
+        df_load_start = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Начало загрузки данных в таблицу f101_round_f']})
+        df_load_start.to_csv(path_filename, mode='a', header = False, index = False)
+
+    df_load_start.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index =  False)
+    
+    df = pd.read_csv("dags/csv_files1.4/dm_f101_round_f.csv", sep=",")
+    df.to_sql(name="dm_f101_round_f_v2", 
+                con=engine, 
+                schema = 'dm',
+                if_exists="append", 
+                index=False,
+                )
+    
+    df_load_end = pd.read_csv(path_filename)
+    last_index = df_load_end.index[-1]
+    df_load_end = pd.DataFrame({'id_load':last_index + 1, 'load_timestamp':[datetime.now()], 'message':['Окончание загрузки данных в таблицу f101_round_f']})
+    df_load_end.to_csv(path_filename, mode='a', header = False, index = False)
+    df_load_end.to_sql('data_load_logs', 
+              con = engine, 
+              schema = 'logs', 
+              if_exists ='append', 
+              index = False)
+
+default_args = {
+    'owner': 'airflow',
+    #'retries': 1,
+    #'retry_delay': timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id='export_import_csv',
+    default_args=default_args,
+    start_date=datetime.now(),
+    catchup=False,
+) as dag:
+
+    start = EmptyOperator(
+        task_id="start"
+    )
+    
+    task_export_from_db = PythonOperator(
+        task_id = 'export_from_db',
+        python_callable=export_from_db
+    )
+
+    task_import_from_csv = PythonOperator(
+        task_id = 'import_from_csv',
+        python_callable=import_from_csv
+    )
+
+    end = EmptyOperator(
+        task_id="end"
+    ) 
+
+
+start >> task_export_from_db >> task_import_from_csv >> end
